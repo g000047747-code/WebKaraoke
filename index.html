@@ -46,6 +46,7 @@ audio{width:100%}
 <div id="stage" class="g"><canvas id="cv"></canvas></div>
 <div id="bot" class="g">
 <label class="btn">📁 曲を選ぶ<input id="file" type="file" accept="audio/*"></label>
+<label class="btn">🧠 モデル<input id="mfile" type="file" accept=".onnx"></label>
 <button id="go" class="main" disabled>▶ スタート</button>
 <span class="sl">遅延補正<input id="lat" type="range" min="0" max="500" value="120" style="width:90px"><span id="latv">120ms</span></span>
 <span class="sp"></span>
@@ -69,6 +70,7 @@ audio{width:100%}
 <button id="hstop">■ 停止</button></div>
 </div></div>
 
+<script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.20.1/dist/ort.all.min.js"></script>
 <script>
 const $=s=>document.querySelector(s);
 const NN=['ド','ド#','レ','レ#','ミ','ファ','ファ#','ソ','ソ#','ラ','ラ#','シ'];
@@ -110,15 +112,78 @@ async function analyze(buf){
  if(hi-lo<14){const c=(hi+lo)/2;lo=Math.floor(c-7);hi=Math.ceil(c+7)}
  return r}
 
+// ---------- AI分離 (UVR MDX-Net ONNX / onnxruntime-web) ----------
+/*DSP*/
+const NF=6144,HP=1024,DF=3072,MARG=22050,COMP=1.035,N3=NF/3;let DT=256;
+const tw=new Float32Array(NF*2);for(let k=0;k<NF;k++){tw[2*k]=Math.cos(2*Math.PI*k/NF);tw[2*k+1]=-Math.sin(2*Math.PI*k/NF)}
+const br=new Uint16Array(N3);{const b=Math.log2(N3);for(let i=0;i<N3;i++){let r=0;for(let j=0;j<b;j++)if(i>>j&1)r|=1<<(b-1-j);br[i]=r}}
+const win=new Float32Array(NF);for(let i=0;i<NF;i++)win[i]=.5-.5*Math.cos(2*Math.PI*i/NF);
+const FA=[0,1,2].map(()=>new Float32Array(N3)),FB=[0,1,2].map(()=>new Float32Array(N3));
+function fft2k(re,im){
+ for(let i=0;i<N3;i++){const j=br[i];if(j>i){let t=re[i];re[i]=re[j];re[j]=t;t=im[i];im[i]=im[j];im[j]=t}}
+ for(let s=2;s<=N3;s<<=1){const h=s>>1,st=N3/s*3;
+  for(let i=0;i<N3;i+=s)for(let k=0;k<h;k++){const wr=tw[2*k*st],wi=tw[2*k*st+1],a=i+k,b=a+h,xr=re[b]*wr-im[b]*wi,xi=re[b]*wi+im[b]*wr;re[b]=re[a]-xr;im[b]=im[a]-xi;re[a]+=xr;im[a]+=xi}}}
+function fft(re,im){
+ for(let r=0;r<3;r++){for(let m=0;m<N3;m++){FA[r][m]=re[3*m+r];FB[r][m]=im[3*m+r]}fft2k(FA[r],FB[r])}
+ for(let q=0;q<3;q++)for(let k=0;k<N3;k++){let sr=0,si=0;for(let r=0;r<3;r++){const ix=(r*(k+N3*q))%NF,wr=tw[2*ix],wi=tw[2*ix+1],ar=FA[r][k],ai=FB[r][k];sr+=ar*wr-ai*wi;si+=ar*wi+ai*wr}re[k+N3*q]=sr;im[k+N3*q]=si}}
+function stft(x){const L=x.length,Rr=new Float32Array(DF*DT),Ii=new Float32Array(DF*DT),re=new Float32Array(NF),im=new Float32Array(NF);
+ for(let t=0;t<DT;t++){const st=t*HP-NF/2;
+  for(let i=0;i<NF;i++){let j=st+i;if(j<0)j=-j;if(j>=L)j=2*(L-1)-j;re[i]=(j>=0&&j<L?x[j]:0)*win[i];im[i]=0}
+  fft(re,im);for(let k=0;k<DF;k++){Rr[k*DT+t]=re[k];Ii[k*DT+t]=im[k]}}
+ return[Rr,Ii]}
+function istft(Rr,Ii){const SEG=HP*(DT-1),out=new Float32Array(SEG),nm=new Float32Array(SEG),re=new Float32Array(NF),im=new Float32Array(NF);
+ for(let t=0;t<DT;t++){
+  for(let k=0;k<DF;k++){re[k]=Rr[k*DT+t];im[k]=-Ii[k*DT+t]}re[DF]=0;im[DF]=0;
+  for(let k=DF+1;k<NF;k++){re[k]=re[NF-k];im[k]=-im[NF-k]}
+  fft(re,im);const st=t*HP-NF/2;
+  for(let i=0;i<NF;i++){const j=st+i;if(j>=0&&j<SEG){const w=win[i];out[j]+=re[i]/NF*w;nm[j]+=w*w}}}
+ for(let j=0;j<SEG;j++)if(nm[j]>1e-6)out[j]/=nm[j];return out}
+/*ENDDSP*/
+let sess=null;
+function mkCtx(){if(!ctx){const A=window.AudioContext||window.webkitAudioContext;try{ctx=new A({sampleRate:44100})}catch{ctx=new A()}}return ctx}
+async function rs44(b){if(b.sampleRate==44100&&b.numberOfChannels==2)return b;const oc=new OfflineAudioContext(2,Math.ceil(b.duration*44100),44100),s=oc.createBufferSource();s.buffer=b;s.connect(oc.destination);s.start();return oc.startRendering()}
+async function getSess(){
+ if(sess)return sess;const blob=await idb('get','model');if(!blob)return null;
+ ort.env.wasm.wasmPaths='https://cdn.jsdelivr.net/npm/onnxruntime-web@1.20.1/dist/';
+ sess=await ort.InferenceSession.create(new Uint8Array(await blob.arrayBuffer()),{executionProviders:['webgpu','wasm']});
+ try{const m=sess.inputMetadata,sh=(Array.isArray(m)?m[0]:m[sess.inputNames[0]]).shape;
+  if(sh&&typeof sh[2]=='number'&&sh[2]!==DF)throw new Error('非対応のモデルです (入力 '+sh.join('x')+')');
+  if(sh&&typeof sh[3]=='number')DT=sh[3]}catch(e){if(/非対応/.test(e.message)){sess=null;throw e}}
+ return sess}
+async function separate(buf){
+ const L=buf.getChannelData(0),R=buf.getChannelData(1),n=L.length,SEG=HP*(DT-1),step=SEG-2*MARG,K=Math.ceil(n/step),Z=DF*DT;
+ const iL=new Float32Array(n),iR=new Float32Array(n);
+ for(let k=0;k<K;k++){
+  const s0=k*step-MARG,cl=new Float32Array(SEG),cr=new Float32Array(SEG);
+  for(let i=0;i<SEG;i++){const j=s0+i;if(j>=0&&j<n){cl[i]=L[j];cr[i]=R[j]}}
+  const a=stft(cl),b=stft(cr),inp=new Float32Array(4*Z);inp.set(a[0],0);inp.set(a[1],Z);inp.set(b[0],2*Z);inp.set(b[1],3*Z);
+  const o=(await sess.run({[sess.inputNames[0]]:new ort.Tensor('float32',inp,[1,4,DF,DT])}))[sess.outputNames[0]].data;
+  const yl=istft(o.subarray(0,Z),o.subarray(Z,2*Z)),yr=istft(o.subarray(2*Z,3*Z),o.subarray(3*Z,4*Z));
+  for(let i=0;i<step;i++){const j=k*step+i;if(j<n){iL[j]=yl[MARG+i]*COMP;iR[j]=yr[MARG+i]*COMP}}
+  $('#msg').textContent='AIで歌声を分離中 '+(k+1)+' / '+K;await new Promise(z=>setTimeout(z))}
+ const io=ctx.createBuffer(2,n,44100),vo=ctx.createBuffer(1,n,44100),vd=vo.getChannelData(0);
+ io.copyToChannel(iL,0);io.copyToChannel(iR,1);for(let i=0;i<n;i++)vd[i]=((L[i]-iL[i])+(R[i]-iR[i]))/2;
+ return{inst:io,voc:vo}}
+const i16=a=>{const o=new Int16Array(a.length);for(let i=0;i<a.length;i++)o[i]=Math.max(-1,Math.min(1,a[i]))*32767;return o};
+function fromCache(c){const b=ctx.createBuffer(2,c.l.length,c.sr),f=new Float32Array(c.l.length);
+ for(let i=0;i<f.length;i++)f[i]=c.l[i]/32767;b.copyToChannel(f,0);for(let i=0;i<f.length;i++)f[i]=c.r[i]/32767;b.copyToChannel(f,1);return b}
+
 // ---------- load ----------
+$('#mfile').onchange=async e=>{const f=e.target.files[0];if(!f)return;
+ try{await idb('put','model',f);sess=null;$('#msg').textContent='モデルを保存しました（'+f.name+'）。曲を選ぶとAI分離が使われます'}catch{$('#msg').textContent='モデルを保存できませんでした'}};
 $('#file').onchange=async e=>{
- const f=e.target.files[0];if(!f)return;
- ctx=ctx||new (window.AudioContext||window.webkitAudioContext)();ctx.resume();
+ const f=e.target.files[0];if(!f)return;mkCtx();ctx.resume();
  title=(prompt('保存時のタイトルを入力してください',f.name.replace(/\.[^.]+$/,''))||f.name).trim();
  songFile=f;$('#ttl').textContent=title;$('#go').disabled=true;ref=null;
- try{$('#msg').textContent='読み込み中…';const buf=await ctx.decodeAudioData(await f.arrayBuffer());
-  inst=mkInst(buf);ref=await analyze(buf);stat=new Uint8Array(ref.length);
-  $('#msg').textContent='準備OK（'+Math.round(buf.duration)+'秒）';$('#go').disabled=false;draw(0)
+ try{$('#msg').textContent='読み込み中…';const dec=await ctx.decodeAudioData(await f.arrayBuffer()),key='c'+f.name+'_'+f.size;
+  let c=null;try{c=await idb('get',key)}catch{}
+  if(c){inst=fromCache(c);ref=c.ref;lo=c.lo;hi=c.hi}
+  else{let s=null;
+   if(typeof ort!='undefined'){try{s=await getSess()}catch(er){$('#msg').textContent='モデルエラー: '+er.message;await new Promise(z=>setTimeout(z,1800))}}
+   if(s){const r=await separate(await rs44(dec));inst=r.inst;$('#msg').textContent='音程を解析中…';ref=await analyze(r.voc);
+    try{await idb('put',key,{sr:44100,l:i16(inst.getChannelData(0)),r:i16(inst.getChannelData(1)),ref,lo,hi})}catch{}}
+   else{inst=mkInst(dec);ref=await analyze(dec);$('#msg').textContent='簡易モード（モデル未設定）'}}
+  stat=new Uint8Array(ref.length);$('#msg').textContent='準備OK（'+Math.round(dec.duration)+'秒）';$('#go').disabled=false;draw(0)
  }catch(err){$('#msg').textContent='エラー: '+err.message}
 };
 $('#lat').oninput=e=>$('#latv').textContent=e.target.value+'ms';
@@ -182,18 +247,18 @@ function render(){const a=meta(),l=$('#list');l.innerHTML='';
   e.innerHTML='<div class="t"><b></b><small>'+d.toLocaleString('ja-JP',{month:'numeric',day:'numeric',hour:'2-digit',minute:'2-digit'})+'</small></div><div class="s">'+r.score.toFixed(1)+'</div><button>▶</button><button>🗑</button>';
   e.querySelector('b').textContent=r.title;const[bp,bd]=e.querySelectorAll('button');
   bp.onclick=()=>playH(r);bd.onclick=async()=>{if(!confirm('「'+r.title+'」を削除しますか？'))return;stopH();await idb('del','r'+r.id);
-   const rest=meta().filter(x=>x.id!=r.id);if(!rest.some(x=>x.sk==r.sk))await idb('del','s'+r.sk);setMeta(rest);render()};
+   const rest=meta().filter(x=>x.id!=r.id);if(!rest.some(x=>x.sk==r.sk)){await idb('del','s'+r.sk);await idb('del','c'+r.sk)}setMeta(rest);render()};
   l.appendChild(e)})}
 $('#hbtn').onclick=()=>{if(playing)return;render();$('#his').classList.add('on')};
 $('#hclose').onclick=()=>{stopH();$('#his').classList.remove('on')};
-$('#hall').onclick=async()=>{if(!confirm('履歴と録音をすべて削除します。よろしいですか？'))return;stopH();await idb('clear');localStorage.removeItem('okh');render()};
+$('#hall').onclick=async()=>{if(!confirm('履歴と録音をすべて削除します。よろしいですか？'))return;stopH();const mdl=await idb('get','model');await idb('clear');if(mdl)await idb('put','model',mdl);localStorage.removeItem('okh');render()};
 $('#hstop').onclick=stopH;
 let gv,gi;
 async function playH(r){
  stopH();ctx=ctx||new (window.AudioContext||window.webkitAudioContext)();await ctx.resume();
  const [rb,sf]=await Promise.all([idb('get','r'+r.id),idb('get','s'+r.sk)]);
  if(!rb||!sf){alert('音声データが見つかりません');return}
- const vb=await ctx.decodeAudioData(await rb.arrayBuffer()),ib=mkInst(await ctx.decodeAudioData(await sf.arrayBuffer()));
+ const vb=await ctx.decodeAudioData(await rb.arrayBuffer()),cc=await idb('get','c'+r.sk),ib=cc?fromCache(cc):mkInst(await ctx.decodeAudioData(await sf.arrayBuffer()));
  gv=ctx.createGain();gi=ctx.createGain();gv.connect(ctx.destination);gi.connect(ctx.destination);
  gv.gain.value=$('#vv').value;gi.gain.value=$('#vi').value;
  const a=ctx.createBufferSource(),b=ctx.createBufferSource();a.buffer=vb;b.buffer=ib;a.connect(gv);b.connect(gi);
